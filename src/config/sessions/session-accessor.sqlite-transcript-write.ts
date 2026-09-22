@@ -485,6 +485,11 @@ export function appendTranscriptMessageSnapshotSync<TMessage>(
   scope: SessionTranscriptWriteScope,
   options: TranscriptMessageAppendOptions<TMessage>,
   preparedMessage?: PreparedTranscriptMessageAppend<TMessage>,
+  workerOptions?: {
+    messageAlreadyRedacted: true;
+    scheduleProjectionReconcile: false;
+    onProjectionReconcileNeeded: () => void;
+  },
 ): Result<
   TranscriptWriteSnapshot<TranscriptMessageAppendResult<TMessage> | undefined>,
   TranscriptAppendRefusal
@@ -492,7 +497,13 @@ export function appendTranscriptMessageSnapshotSync<TMessage>(
   return runTranscriptWriteSnapshotSync(
     scope,
     (database, resolved) =>
-      appendTranscriptMessageInTransaction(database, resolved, options, preparedMessage),
+      appendTranscriptMessageInTransaction(
+        database,
+        resolved,
+        workerOptions ? { ...options, messageAlreadyRedacted: true } : options,
+        preparedMessage,
+        workerOptions,
+      ),
     undefined,
     options.expectedMutationAt,
   );

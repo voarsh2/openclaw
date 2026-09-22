@@ -21,7 +21,10 @@ import {
   resolveSqliteTranscriptScope,
   toDatabaseOptions,
 } from "../../config/sessions/session-accessor.sqlite-scope.js";
-import { appendTranscriptEventSnapshotSync } from "../../config/sessions/session-accessor.sqlite-transcript-write.js";
+import {
+  appendTranscriptEventSnapshotSync,
+  appendTranscriptMessageSnapshotSync,
+} from "../../config/sessions/session-accessor.sqlite-transcript-write.js";
 import type { SessionTranscriptRuntimeTarget } from "../../config/sessions/session-accessor.types.js";
 import { assertCanonicalSessionKeyWrite } from "../../config/sessions/session-canonical-key.js";
 import { runWithSessionTranscriptReadFence } from "../../config/sessions/session-transcript-read-fence.js";
@@ -39,6 +42,7 @@ import {
   encodeOpenClawStateWorkerError,
   type OpenClawStateWorkerErrorPayload,
 } from "../../state/openclaw-state-worker-error.js";
+import type { CustomMessage } from "./messages.js";
 import type {
   ModelChangeEntry,
   SessionHeader,
@@ -52,6 +56,13 @@ import type {
 type MetadataTarget = Omit<SessionTranscriptWriteScope, "env"> & SessionTranscriptRuntimeTarget;
 
 export type SessionMetadataOperations = {
+  "session.transcript.appendMessage": {
+    input: { scope: MetadataTarget; message: CustomMessage; cwd: string };
+    output: {
+      snapshot: ReturnType<typeof appendTranscriptMessageSnapshotSync<CustomMessage>>;
+      projectionNeedsReconcile: boolean;
+    };
+  };
   "session.metadata.initialize": {
     input: {
       scope: MetadataTarget;
@@ -186,6 +197,31 @@ export function bindSqliteWorkerBackend(
       return { ok: true, value: readTranscriptMutationAtSync(scope) };
     }
     assertCanonicalSessionKeyWrite(resolved.sessionKey, resolved.agentId);
+    if (command.type === "session.transcript.appendMessage") {
+      return runOpenClawAgentWriteTransaction<
+        SessionMetadataWorkerOperations["session.transcript.appendMessage"]["output"]
+      >((database) => {
+        if (database.db !== context.database) {
+          throw new Error("Session message lost its borrowed canonical connection");
+        }
+        context.admit("transaction");
+        let projectionNeedsReconcile = false;
+        const snapshot = appendTranscriptMessageSnapshotSync(
+          scope,
+          { message: command.input.message, cwd: command.input.cwd },
+          undefined,
+          {
+            messageAlreadyRedacted: true,
+            scheduleProjectionReconcile: false,
+            onProjectionReconcileNeeded: () => {
+              projectionNeedsReconcile = true;
+            },
+          },
+        );
+        context.admit("commit");
+        return { ok: true, value: { snapshot, projectionNeedsReconcile } };
+      }, options);
+    }
     const outcome = runOpenClawAgentWriteTransaction<
       SessionMetadataWorkerOperations[
         | "session.metadata.initialize"

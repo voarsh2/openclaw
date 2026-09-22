@@ -1,6 +1,32 @@
+import path from "node:path";
+import { DatabaseSync, StatementSync } from "node:sqlite";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  loadSessionEntryReadOnly,
+  loadTranscriptEvents,
+  upsertSessionEntryCore,
+} from "../../../config/sessions/session-accessor.js";
+import { waitForSessionTranscriptProjection } from "../../../config/sessions/session-transcript-reconcile.js";
+import { withOwnedSessionTranscriptWrites } from "../../../config/sessions/transcript-write-context.js";
+import { SqliteWorkerError } from "../../../infra/sqlite-worker-contract.js";
+import * as workerAdmission from "../../../infra/sqlite-worker-operation-admission.js";
+import * as workerStore from "../../../infra/sqlite-worker-store.js";
+import type {
+  SqliteWorkerOperations,
+  SqliteWorkerStore,
+} from "../../../infra/sqlite-worker-store.js";
 import { createNestedToolActivity } from "../../../sessions/nested-tool-activity.js";
+import { createDeferredCore } from "../../../shared/deferred.js";
+import { openOpenClawAgentDatabase } from "../../../state/openclaw-agent-db.js";
+import {
+  withOpenClawTestState,
+  type OpenClawTestState,
+} from "../../../test-utils/openclaw-test-state.js";
 import { createTestAdmittedRunContext } from "../../admitted-run-context.test-support.js";
+import { runWithModelFallback } from "../../model-fallback-runner.js";
+import { isRecordedModelFallbackStop } from "../../model-fallback-stop.js";
+import { SessionManager } from "../../sessions/session-manager.js";
 import { createUsageAccumulator } from "../usage-accumulator.js";
 
 const mocks = vi.hoisted(() => ({
@@ -46,297 +72,106 @@ vi.mock("./attempt-stream-settle.js", () => ({
   settleEmbeddedAttemptStream: mocks.settleStream,
 }));
 
+import { createFixture } from "./attempt-execution-settle.test-support.js";
 import { runEmbeddedAttemptSettledPhase } from "./attempt-settle.js";
+import { createEmbeddedAttemptTranscriptLifecycle } from "./attempt-transcript-lifecycle.js";
 import { createEmbeddedRunContextRecoveryState } from "./context-recovery-state.js";
 import { prepareEmbeddedRunTerminal } from "./terminal-preparation.js";
 
-type SettledInput = Parameters<typeof runEmbeddedAttemptSettledPhase>[0];
-
-function createFixture() {
-  const order: string[] = [];
-  const queueHandle = { kind: "embedded", runId: "run-1" };
-  const unsubscribe = vi.fn(() => order.push("unsubscribe"));
-  const waitForPendingEvents = vi.fn(async () => undefined);
-  const subscription = {
-    assistantTexts: [],
-    didSendDeterministicApprovalPrompt: vi.fn(() => false),
-    didSendViaMessagingTool: vi.fn(() => false),
-    getAcceptedSessionSpawns: vi.fn(() => []),
-    getAssistantTurnCount: vi.fn(() => 1),
-    getCompactionCount: vi.fn(() => 0),
-    getCurrentAttemptAssistant: vi.fn(() => undefined),
-    getHeartbeatToolResponse: vi.fn(() => undefined),
-    getItemLifecycle: vi.fn(() => ({ startedCount: 0, completedCount: 0, activeCount: 0 })),
-    getLastAssistantTextMessageIndex: vi.fn(() => undefined),
-    getLastAssistantUsage: vi.fn(() => undefined),
-    getLastCompactionTokensAfter: vi.fn(() => undefined),
-    getLastToolError: vi.fn(() => undefined),
-    getLatestMcpAppChannelView: vi.fn(() => undefined),
-    getLatestMcpConnectAction: vi.fn(() => undefined),
-    getMessagingToolSentMediaUrls: vi.fn(() => []),
-    getMessagingToolSentTargets: vi.fn(() => []),
-    getMessagingToolSentTexts: vi.fn(() => []),
-    getMessagingToolSourceReplyPayloads: vi.fn(() => []),
-    getSourceReplyDelivered: vi.fn(() => undefined),
-    getSourceReplyDeliveryState: vi.fn(() => undefined),
-    getPendingToolMediaReply: vi.fn(() => undefined),
-    getToolAutoDeliveryMediaUrls: vi.fn(() => []),
-    getReplayState: vi.fn(() => ({ replayInvalid: false, hadPotentialSideEffects: false })),
-    getSuccessfulCronAdds: vi.fn(() => []),
-    getUsageTotals: vi.fn(() => ({ input: 1, output: 2, total: 3 })),
-    getVisibleBlockReplyCount: vi.fn(() => 0),
-    hasToolMediaBlockReply: vi.fn(() => false),
-    hasSuccessfulModelResponse: vi.fn(() => false),
-    isCompactionInFlight: vi.fn(() => false),
-    setTerminalLifecycleMeta: vi.fn(),
-    toolMetas: [{ toolName: "exec", isError: false }],
-    unsubscribe,
-    waitForCompactionRetry: vi.fn(async () => undefined),
-    waitForPendingEvents,
+async function createPersistedImageNoteFixture(
+  testState: OpenClawTestState,
+  storage: "file-backed" | "incognito" = "file-backed",
+  reopen = false,
+) {
+  const fixture = createFixture(mocks);
+  const target = {
+    agentId: "main",
+    sessionId: "image-note",
+    sessionKey:
+      storage === "incognito"
+        ? "agent:main:dashboard:incognito-image-note"
+        : "agent:main:image-note",
+    storePath: path.join(testState.agentDir("main"), "openclaw-agent.sqlite"),
   };
-  const detachBackend = vi.fn(() => order.push("detach-backend"));
-  const clearTimers = vi.fn(() => order.push("clear-timers"));
-  const getBeforeAgentFinalizeRevisionReason = vi.fn(() => "revision");
-  const getBeforeAgentFinalizeRevisionEntryId = vi.fn(() => undefined);
-  const promptActiveSession = vi.fn(async () => undefined);
-  const messages = [
-    {
-      role: "assistant",
-      content: [{ type: "text", text: "done" }],
-      api: "openai-responses",
-      provider: "openai",
-      model: "model",
-      usage: {
-        input: 1,
-        output: 2,
-        cacheRead: 0,
-        cacheWrite: 0,
-        totalTokens: 3,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-      },
-      stopReason: "stop",
-      timestamp: 100,
-    },
-  ];
-  const activeSession = {
-    agent: { state: { messages } },
-    isCompacting: false,
-    isStreaming: false,
-    messages,
-    sessionId: "active-session",
-    getActiveToolNames: vi.fn(() => ["read"]),
-  };
-  const sessionManager = {
-    kind: "session-manager",
-    appendMessage: vi.fn((message) => messages.push(message)),
-    buildSessionContext: vi.fn(() => ({ messages: [] })),
-    getSessionTarget: vi.fn(() => undefined),
-    getSessionId: () => "active-session",
-  };
-  const hookRunner = { hasHooks: vi.fn(() => false) };
-  const cacheTrace = { recordStage: vi.fn() };
-  const trajectoryRecorder = { recordEvent: vi.fn(), flush: vi.fn(async () => undefined) };
-  const toolResultPromptProjectionState = { kind: "tool-result-projection" };
-  const sessionPromptState = { toolResults: toolResultPromptProjectionState };
-  const sessionRuntimeState = {
-    currentTurnImageFailureCount: 0,
-    prePromptMessageCount: 2,
-    promptCache: undefined,
-    systemPromptText: "system prompt",
-  };
-  const state: SettledInput["state"] = {
-    beforeAgentRunBlockedBy: undefined,
-    terminal: { kind: "ok" },
-    trajectoryEndRecorded: false,
-  };
-  const result = { messages: [{ role: "assistant", content: "done" }] };
-  const preparedStreamRuntime = {
-    abortable: (promise: Promise<unknown>) => promise,
-    cache: {},
-    history: {
-      contextEnginePromptAuthority: "assembled",
-      contextEngineAssemblySucceeded: true,
-      unwindowedContextEngineMessagesForPrecheck: [{ role: "user", content: "history" }],
-    },
-    isProbeSession: false,
-    onBlockReplyFlush: vi.fn(),
-    promptActiveSession,
-    stream: {
-      subscription,
-      queueHandle,
-      stopAcceptingSteerMessages: vi.fn(),
-      getBeforeAgentFinalizeRevisionReason,
-      getBeforeAgentFinalizeRevisionEntryId,
-    },
-    timeout: {
-      getRunAbortDeadlineAtMs: vi.fn(() => 123),
-      clearTimers,
-    },
-  };
-  const sessionRuntime = {
-    agentSession: {
-      activeSession,
-      clientToolCallSlots: [],
-      hasDeliveredSourceReply: vi.fn(() => true),
-      hookRunner,
-      setActiveSessionSystemPrompt: vi.fn(),
-      settingsManager: { getCompactionReserveTokens: vi.fn(() => 1_000) },
-    },
-    anthropicPayloadLogger: {},
-    boundary: {
-      boundaryTimezone: "UTC",
-      includeBoundaryTimestamp: true,
-      orphanRepair: undefined,
-      setCurrentUserTimestampOverride: vi.fn(),
-    },
-    cacheTrace,
-    contextGuards: {
-      getAfterTurnCheckpoint: vi.fn(() => 2),
-      takePendingMidTurnPrecheckRequest: vi.fn(() => null),
-    },
-    preparedUserTurnMessage: {
-      role: "user",
-      content: "hello",
-      timestamp: 100,
-      __openclaw: { senderName: "Alice" },
-    },
-    sessionManager,
-    sessionPromptState,
-    state: sessionRuntimeState,
-    toolResultPromptProjectionState,
-    trajectoryRecorder,
-    transcriptPolicy: { appendOnlyRuntimeContext: true },
-    transport: {
-      effectiveAgentTransport: "sse",
-      effectiveExtraParams: {},
-      effectivePromptCacheRetention: "long",
-      streamStrategy: "provider",
-    },
-  };
-  const input = {
-    attempt: {
-      admittedRunContext: createTestAdmittedRunContext("run-1"),
-      config: {},
-      model: { api: "openai-responses" },
-      modelId: "model",
-      promptCacheKey: undefined,
-      provider: "openai",
-      replyOperation: { detachBackend, turnKind: "visible" },
-      runId: "run-1",
-      sessionFile: "/tmp/session.jsonl",
-      sessionId: "session-1",
-      sessionKey: "agent:main",
-      trigger: "user",
-      workspaceDir: "/workspace",
-    },
-    agentDir: "/agent",
-    isRawModelRun: false,
-    resolveActiveContextEnginePluginId: vi.fn(),
-    runAbortController: new AbortController(),
-    prepared: {
-      promptToolPolicy: { apply: vi.fn(), refresh: vi.fn(), current: {} },
-      bootstrap: {
-        bootstrapPromptWarning: {},
-        shouldRecordCompletedBootstrapTurn: false,
-      },
-      bundleTools: {
-        tools: [{ name: "read" }],
-        uncompactedEffectiveTools: [{ name: "read" }],
-      },
-      sessionRuntime,
-      systemPrompt: {
-        runtimeInfo: { model: { id: "model" } },
-        systemPromptReport: { chars: 13 },
-      },
-      toolBase: { nestedToolActivities: [] },
-      toolCatalog: {
-        effectiveTools: [{ name: "read" }],
-        emptyExplicitToolAllowlistError: undefined,
-        toolSearch: { compacted: false },
-      },
-    },
-    sessionLock: {
-      withOwnedTranscriptWrite: vi.fn(async (operation: () => unknown) => await operation()),
-    },
-    setup: {
-      effectiveFsWorkspaceOnly: false,
-      effectiveWorkspace: "/workspace",
-      sandbox: null,
-      sessionAgentId: "main",
-    },
-    diagnostics: { diagnosticTrace: {}, runTrace: {} },
-    state,
-    lifecycle: {
-      readYieldState: () => ({
-        yieldAbortSettled: null,
-        yieldDetected: true,
-        yieldMessage: "yield",
-      }),
-    },
-    getRepairedRejectedProviderReplay: () => true,
-    preparedStreamRuntime,
-  } as unknown as SettledInput;
-
-  mocks.runPrompt.mockImplementation(async (promptInput, promptState) => {
-    order.push("prompt");
-    Object.assign(promptState, {
-      contextBudgetStatus: { status: "ok" },
-      preflightRecovery: { attempted: false },
-      finalPromptText: "final prompt",
-    });
-    promptInput.prepared.sessionRuntime.state.prePromptMessageCount = 4;
-    promptInput.state.beforeAgentRunBlockedBy = "before_agent";
-    return { promptStartedAt: 100, transcriptLeafId: "before-prompt" };
+  const entry = reopen
+    ? loadSessionEntryReadOnly(target)
+    : await upsertSessionEntryCore(target, {
+        sessionId: target.sessionId,
+        updatedAt: 1,
+        lifecycleRevision: "image-note-generation",
+        activeWriterRunId: fixture.input.attempt.runId,
+        ...(storage === "incognito" ? { incognito: true } : {}),
+      });
+  if (!entry?.lifecycleRevision) {
+    throw new Error("Expected a durable lifecycle revision for the admitted image-note writer");
+  }
+  const manager = reopen
+    ? await SessionManager.openAsync(target, testState.workspaceDir)
+    : SessionManager.open(target, testState.workspaceDir);
+  const activeSession = fixture.input.prepared.sessionRuntime.agentSession.activeSession;
+  if (!reopen) {
+    manager.appendMessage({ role: "user", content: "Describe this image", timestamp: 1 });
+    for (const message of activeSession.messages) {
+      if (message.role !== "assistant") {
+        throw new Error("Expected the completed assistant turn in the settlement fixture");
+      }
+      manager.appendMessage(message);
+    }
+  }
+  await waitForSessionTranscriptProjection(target);
+  const before = await loadTranscriptEvents(target);
+  const previousLeaf = manager.getLeafId();
+  const previousMessages = manager.buildSessionContext().messages;
+  activeSession.agent.state.messages = [...previousMessages];
+  Object.defineProperty(activeSession, "messages", {
+    get: () => activeSession.agent.state.messages,
   });
-  mocks.settleStream.mockImplementation(async () => {
-    order.push("finalize");
-    return {
-      promptError: null,
-      promptErrorSource: null,
-      timedOutDuringCompaction: false,
-      messagesSnapshot: [{ role: "assistant", content: "done" }],
-      sessionIdUsed: "settled-session",
-      lastAssistant: { role: "assistant", content: "done" },
-      currentAttemptAssistant: { role: "assistant", content: "done" },
-      currentAttemptCompletedAssistant: undefined,
-      attemptUsage: { input: 1, output: 2, total: 3 },
-      promptCache: { cacheRead: 1 },
-      lastCallUsage: undefined,
-      compactionOccurredThisAttempt: false,
-    };
-  });
-  mocks.completeAfterTurn.mockResolvedValue(undefined);
-  mocks.completeResult.mockImplementation(() => {
-    order.push("result");
-    return result;
-  });
-  mocks.clearActiveEmbeddedRun.mockImplementation(() => order.push("clear-active-run"));
-
+  fixture.input.prepared.sessionRuntime.sessionManager = manager;
+  fixture.input.attempt.sessionTarget = target;
+  fixture.input.attempt.sessionId = target.sessionId;
+  fixture.input.attempt.sessionKey = target.sessionKey;
+  fixture.input.getRepairedRejectedProviderReplay = () => false;
+  fixture.input.preparedStreamRuntime.stream.getBeforeAgentFinalizeRevisionReason = () => undefined;
+  fixture.sessionRuntimeState.currentTurnImageFailureCount = 1;
+  const settleStream = mocks.settleStream.getMockImplementation()!;
+  mocks.settleStream.mockImplementationOnce(async (...args) => ({
+    ...(await settleStream(...args)),
+    messagesSnapshot: [...previousMessages],
+  }));
+  const lifecycle = createEmbeddedAttemptTranscriptLifecycle(fixture.input.attempt);
+  fixture.input.sessionLock.withOwnedTranscriptWrite = (operation) =>
+    withOwnedSessionTranscriptWrites(
+      {
+        sessionTarget: {
+          ...target,
+          expectedLifecycleRevision: entry.lifecycleRevision,
+          expectedWriterRunId: fixture.input.attempt.runId,
+        },
+        assertCommitAllowed: () => fixture.input.runAbortController.signal.throwIfAborted(),
+        withTranscriptWrite: (write) => lifecycle.withTranscriptWrite(write),
+      },
+      () => lifecycle.withTranscriptWrite(operation),
+    );
   return {
-    cacheTrace,
-    clearTimers,
-    detachBackend,
-    getBeforeAgentFinalizeRevisionReason,
-    input,
-    order,
-    queueHandle,
-    result,
-    sessionManager,
-    sessionRuntimeState,
-    state,
-    subscription,
-    trajectoryRecorder,
-    unsubscribe,
+    fixture,
+    target,
+    manager,
+    activeSession,
+    before,
+    previousLeaf,
+    previousMessages,
+    lifecycle,
   };
 }
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.completeResult.mockReset();
 });
 
 describe("runEmbeddedAttemptSettledPhase", () => {
   it("runs prompt and finalization, cleans stream resources, then projects the result", async () => {
-    const fixture = createFixture();
+    const fixture = createFixture(mocks);
 
     const result = await runEmbeddedAttemptSettledPhase(fixture.input);
 
@@ -387,7 +222,7 @@ describe("runEmbeddedAttemptSettledPhase", () => {
   });
 
   it("persists image failure notes after after-turn transcript reconciliation", async () => {
-    const fixture = createFixture();
+    const fixture = createFixture(mocks);
     fixture.sessionRuntimeState.currentTurnImageFailureCount = 1;
     await runEmbeddedAttemptSettledPhase(fixture.input);
 
@@ -412,8 +247,376 @@ describe("runEmbeddedAttemptSettledPhase", () => {
     );
   });
 
+  it("persists and publishes image failure notes through settlement without parent SQL", async () => {
+    await withOpenClawTestState({ label: "settled-image-note" }, async (testState) => {
+      const { fixture, target, activeSession, before, previousLeaf, previousMessages, lifecycle } =
+        await createPersistedImageNoteFixture(testState);
+      const actualAttemptResult =
+        await vi.importActual<typeof import("./attempt-result.js")>("./attempt-result.js");
+      mocks.completeResult.mockImplementationOnce(
+        actualAttemptResult.completeEmbeddedAttemptResult,
+      );
+
+      try {
+        const database = openOpenClawAgentDatabase({ agentId: "main", path: target.storePath });
+        // Prepare before instrumentation so the probes must observe cached statements too.
+        const calibration = database.db.prepare("SELECT 1 AS value");
+        const probes = {
+          prepare: vi.spyOn(DatabaseSync.prototype, "prepare"),
+          exec: vi.spyOn(DatabaseSync.prototype, "exec"),
+          get: vi.spyOn(StatementSync.prototype, "get"),
+          all: vi.spyOn(StatementSync.prototype, "all"),
+          run: vi.spyOn(StatementSync.prototype, "run"),
+          iterate: vi.spyOn(StatementSync.prototype, "iterate"),
+        };
+        const measured = await (async () => {
+          try {
+            database.db.exec("SELECT 1");
+            database.db.prepare("SELECT 1");
+            calibration.get();
+            calibration.all();
+            calibration.run();
+            expect([...calibration.iterate()]).toEqual([{ value: 1 }]);
+            for (const [name, probe] of Object.entries(probes)) {
+              expect(
+                probe.mock.calls.length,
+                `positive parent ${name} calibration`,
+              ).toBeGreaterThan(0);
+              probe.mockClear();
+            }
+
+            const result = await runEmbeddedAttemptSettledPhase(fixture.input);
+            return {
+              result,
+              parentSql: Object.fromEntries(
+                Object.entries(probes).map(([name, probe]) => [name, probe.mock.calls.length]),
+              ),
+            };
+          } finally {
+            Object.values(probes).forEach((probe) => probe.mockRestore());
+          }
+        })();
+
+        const after = await loadTranscriptEvents(target);
+        expect(after.slice(0, before.length)).toEqual(before);
+        expect(after).toHaveLength(before.length + 1);
+        const reopened = SessionManager.open(target);
+        const appended = reopened.getLeafEntry();
+        expect(appended).toMatchObject({
+          type: "message",
+          parentId: previousLeaf,
+          message: {
+            role: "custom",
+            customType: "openclaw.system-note",
+            display: true,
+            content: expect.stringMatching(/1.*image contents.*unavailable.*resend.*not claim/is),
+            details: {
+              source: "prompt-image-hydration",
+              runId: fixture.input.attempt.runId,
+              failedMediaCount: 1,
+            },
+            timestamp: expect.any(Number),
+          },
+        });
+        if (appended?.type !== "message") {
+          throw new Error("Expected a durable image failure message");
+        }
+        expect(appended.message).not.toHaveProperty("excludeFromContext");
+        const expectedMessages = [...previousMessages, appended.message];
+        expect(activeSession.messages).toEqual(expectedMessages);
+        expect(measured.result.messagesSnapshot).toEqual(expectedMessages);
+        expect(fixture.unsubscribe).toHaveBeenCalledOnce();
+        expect(fixture.detachBackend).toHaveBeenCalledOnce();
+        expect(measured.parentSql).toEqual({
+          prepare: 0,
+          exec: 0,
+          get: 0,
+          all: 0,
+          run: 0,
+          iterate: 0,
+        });
+      } finally {
+        await lifecycle.dispose();
+      }
+    });
+  });
+
+  it.each([
+    { storage: "file-backed", redact: false },
+    { storage: "file-backed", redact: true },
+    { storage: "incognito", redact: true },
+  ] as const)(
+    "retains one canonical $storage image note through configured fallback (redacted: $redact)",
+    async ({ storage, redact }) => {
+      await withOpenClawTestState({ label: "settled-image-note-redaction" }, async (testState) => {
+        const first = await createPersistedImageNoteFixture(testState, storage);
+        const { target, before, previousMessages } = first;
+        const config = redact ? { logging: { redactPatterns: ["run-1"] } } : undefined;
+        const actualAttemptResult =
+          await vi.importActual<typeof import("./attempt-result.js")>("./attempt-result.js");
+        const cleanupFailure = new Error("backend detach failed after image note publication");
+        first.fixture.detachBackend.mockImplementationOnce(() => {
+          throw cleanupFailure;
+        });
+        const attempts: Array<typeof first> = [];
+        const routes: string[] = [];
+        const joined: Array<typeof first> = [];
+        const onError = vi.fn();
+        try {
+          const fallback = await runWithModelFallback({
+            cfg: config,
+            provider: "fixture-provider",
+            model: "fixture-model",
+            manifestPlugins: [],
+            fallbacksOverride: ["fixture-next/fixture-model"],
+            skipAuthProfileRuntime: true,
+            runId: first.fixture.input.attempt.runId,
+            onError,
+            run: async (provider) => {
+              const current =
+                attempts.length === 0
+                  ? first
+                  : await createPersistedImageNoteFixture(testState, storage, true);
+              routes.push(provider);
+              attempts.push(current);
+              if (current !== first) {
+                expect(joined).toEqual([first]);
+                expect(current.manager).not.toBe(first.manager);
+                expect(current.lifecycle).not.toBe(first.lifecycle);
+                expect(current.previousMessages).toEqual(first.activeSession.messages);
+              }
+              current.fixture.input.attempt.config = config;
+              mocks.completeResult.mockImplementation(
+                actualAttemptResult.completeEmbeddedAttemptResult,
+              );
+              expect(current.fixture.input.attempt.runId).toBe(first.fixture.input.attempt.runId);
+              try {
+                return await runEmbeddedAttemptSettledPhase(current.fixture.input);
+              } finally {
+                await current.lifecycle.dispose();
+                joined.push(current);
+              }
+            },
+          });
+          expect(routes).toEqual(["fixture-provider", "fixture-next"]);
+          expect(fallback.provider).toBe("fixture-next");
+          expect(onError).toHaveBeenCalledOnce();
+          expect(onError).toHaveBeenCalledWith(
+            expect.objectContaining({
+              error: cleanupFailure,
+              attempt: 1,
+              total: 2,
+            }),
+          );
+          expect(attempts).toHaveLength(2);
+          expect(joined).toEqual(attempts);
+          const after = await loadTranscriptEvents(target);
+          expect(after.slice(0, before.length)).toEqual(before);
+          expect(after).toHaveLength(before.length + 1);
+          const stored = SessionManager.open(target).getLeafEntry();
+          expect(stored).toMatchObject({
+            type: "message",
+            message: { role: "custom", customType: "openclaw.system-note" },
+          });
+          if (stored?.type !== "message") {
+            throw new Error("Expected a durable image failure message");
+          }
+          if (redact) {
+            expect(JSON.stringify(stored.message)).not.toContain("run-1");
+          } else {
+            expect(stored.message).toMatchObject({ details: { runId: "run-1" } });
+          }
+          const expected = [...previousMessages, stored.message];
+          expect(fallback.result.messagesSnapshot).toEqual(expected);
+          for (const attempt of attempts) {
+            expect(attempt.activeSession.messages).toEqual(expected);
+            expect(attempt.fixture.unsubscribe).toHaveBeenCalledOnce();
+            expect(attempt.fixture.detachBackend).toHaveBeenCalledOnce();
+            expect(attempt.fixture.clearTimers).toHaveBeenCalledOnce();
+          }
+          expect(mocks.clearActiveEmbeddedRun).toHaveBeenCalledTimes(2);
+          expect(mocks.completeResult).toHaveBeenCalledOnce();
+        } finally {
+          await first.lifecycle.dispose();
+          await Promise.all(attempts.map((attempt) => attempt.lifecycle.dispose()));
+        }
+      });
+    },
+  );
+
+  it.each(["cancel before commit", "retarget after commit", "unknown reply after commit"] as const)(
+    "keeps image note publication with its original owner: %s",
+    async (transition) => {
+      await withOpenClawTestState({ label: "settled-image-note-owner" }, async (testState) => {
+        const { fixture, target, manager, activeSession, before, previousMessages, lifecycle } =
+          await createPersistedImageNoteFixture(testState);
+        const replacement = {
+          ...target,
+          sessionId: "replacement",
+          sessionKey: "agent:main:replacement",
+        };
+        await upsertSessionEntryCore(replacement, {
+          sessionId: replacement.sessionId,
+          updatedAt: 1,
+        });
+        const replacementManager = SessionManager.open(replacement);
+        replacementManager.appendMessage({
+          role: "user",
+          content: "Keep replacement",
+          timestamp: 2,
+        });
+        await waitForSessionTranscriptProjection(replacement);
+        const replacementBefore = await loadTranscriptEvents(replacement);
+        const replacementMessages = replacementManager.buildSessionContext().messages;
+        const committed = createDeferredCore();
+        const release = createDeferredCore();
+        const cancellation = new Error("image note owner cancelled before commit");
+        let noteInFlight = false;
+        let interceptedNotes = 0;
+        let cancelledGrants = 0;
+        const createAdmission = workerAdmission.createSqliteWorkerOperationAdmission;
+        const admissionSpy = vi
+          .spyOn(workerAdmission, "createSqliteWorkerOperationAdmission")
+          .mockImplementation((admit) =>
+            createAdmission((request, grant) => {
+              if (
+                transition === "cancel before commit" &&
+                noteInFlight &&
+                request.stage === "commit"
+              ) {
+                cancelledGrants++;
+                fixture.input.runAbortController.abort(cancellation);
+              }
+              admit(request, grant);
+            }),
+          );
+        const runOperation = workerStore.runSqliteWorkerStoreOperation;
+        const operationSpy = vi
+          .spyOn(workerStore, "runSqliteWorkerStoreOperation")
+          .mockImplementation(
+            <Operations extends SqliteWorkerOperations, T>(
+              store: SqliteWorkerStore<Operations>,
+              operation: (scope: Pick<SqliteWorkerStore<Operations>, "execute">) => T | Promise<T>,
+              stateContext?: Parameters<typeof runOperation>[2],
+              assertCurrent?: Parameters<typeof runOperation>[3],
+              admission?: Parameters<typeof runOperation>[4],
+              requireStateLifecycle?: Parameters<typeof runOperation>[5],
+            ) =>
+              runOperation(
+                store,
+                (scope) =>
+                  operation({
+                    execute: async (command, options) => {
+                      const selected =
+                        command.type === "database.domain.execute" &&
+                        isRecord(command.input) &&
+                        isRecord(command.input.command) &&
+                        command.input.command.type === "session.transcript.appendMessage";
+                      if (!selected) {
+                        return await scope.execute(command, options);
+                      }
+                      interceptedNotes++;
+                      noteInFlight = true;
+                      try {
+                        const result = await scope.execute(command, options);
+                        if (transition === "unknown reply after commit") {
+                          throw new SqliteWorkerError(
+                            "Transcript reply outcome is unknown",
+                            "outcome-unknown",
+                          );
+                        }
+                        if (transition === "retarget after commit") {
+                          committed.resolve();
+                          await release.promise;
+                        }
+                        return result;
+                      } finally {
+                        noteInFlight = false;
+                      }
+                    },
+                  }),
+                stateContext,
+                assertCurrent,
+                admission,
+                requireStateLifecycle,
+              ),
+          );
+        const outcome = runEmbeddedAttemptSettledPhase(fixture.input).then(
+          (value) => ({ ok: true as const, value }),
+          (error: unknown) => ({ ok: false as const, error }),
+        );
+        try {
+          if (transition === "retarget after commit") {
+            await Promise.race([
+              committed.promise,
+              outcome.then(() => {
+                throw new Error("Attempt settled before the real image note commit boundary");
+              }),
+            ]);
+            expect(activeSession.messages).toEqual(previousMessages);
+            expect(mocks.completeResult).not.toHaveBeenCalled();
+            manager.setSessionTarget(replacement);
+            activeSession.agent.state.messages = [...replacementMessages];
+            release.resolve();
+          }
+          const settled = await outcome;
+          expect(interceptedNotes).toBe(1);
+          expect(settled.ok).toBe(false);
+          if (settled.ok) {
+            throw new Error("Expected stale image note publication to be rejected");
+          }
+          expect(mocks.completeResult).not.toHaveBeenCalled();
+          expect(fixture.unsubscribe).toHaveBeenCalledOnce();
+          expect(fixture.detachBackend).toHaveBeenCalledOnce();
+          expect(await loadTranscriptEvents(replacement)).toEqual(replacementBefore);
+          const originalAfter = await loadTranscriptEvents(target);
+          if (transition === "cancel before commit") {
+            expect(cancelledGrants).toBe(1);
+            expect(settled.error).toMatchObject({ message: cancellation.message });
+            expect(isRecordedModelFallbackStop(settled.error)).toBe(false);
+            expect(originalAfter).toEqual(before);
+            expect(activeSession.messages).toEqual(previousMessages);
+          } else {
+            expect(cancelledGrants).toBe(0);
+            expect(originalAfter.slice(0, before.length)).toEqual(before);
+            expect(originalAfter).toHaveLength(before.length + 1);
+            expect(originalAfter.at(-1)).toMatchObject({
+              type: "message",
+              message: {
+                customType: "openclaw.system-note",
+                details: { source: "prompt-image-hydration", runId: fixture.input.attempt.runId },
+              },
+            });
+            expect(isRecordedModelFallbackStop(settled.error)).toBe(true);
+            const committedEntry = SessionManager.open(target).getLeafEntry();
+            expect(committedEntry).toBeDefined();
+            if (transition === "retarget after commit") {
+              expect(settled.error).toMatchObject({
+                message: expect.stringMatching(/committed.*do not replay/is),
+                committedMessageId: committedEntry?.id,
+                committedTarget: target,
+              });
+              expect(activeSession.messages).toEqual(replacementMessages);
+              expect(manager.getSessionTarget()?.sessionId).toBe(replacement.sessionId);
+            } else {
+              expect(settled.error).toMatchObject({ code: "outcome-unknown" });
+              expect(settled.error).not.toHaveProperty("committedMessageId");
+              expect(activeSession.messages).toEqual(previousMessages);
+            }
+          }
+        } finally {
+          release.resolve();
+          await outcome;
+          operationSpy.mockRestore();
+          admissionSpy.mockRestore();
+          await lifecycle.dispose();
+        }
+      });
+    },
+  );
+
   it("carries a successful hidden target through settlement into the terminal receipt", async () => {
-    const fixture = createFixture();
+    const fixture = createFixture(mocks);
     fixture.input.prepared.toolBase.nestedToolActivities.push(
       createNestedToolActivity({
         runId: "run-test",
@@ -497,7 +700,7 @@ describe("runEmbeddedAttemptSettledPhase", () => {
   });
 
   it("preserves a prompt failure while still completing stream cleanup", async () => {
-    const fixture = createFixture();
+    const fixture = createFixture(mocks);
     const failure = new Error("prompt failed");
     mocks.runPrompt.mockRejectedValueOnce(failure);
     fixture.unsubscribe.mockImplementationOnce(() => {
@@ -517,7 +720,7 @@ describe("runEmbeddedAttemptSettledPhase", () => {
   });
 
   it("releases the active run when backend cleanup throws during a failed prompt", async () => {
-    const fixture = createFixture();
+    const fixture = createFixture(mocks);
     const failure = new Error("prompt failed");
     mocks.runPrompt.mockRejectedValueOnce(failure);
     fixture.detachBackend.mockImplementationOnce(() => {
@@ -534,7 +737,7 @@ describe("runEmbeddedAttemptSettledPhase", () => {
   });
 
   it("reports a backend cleanup failure after releasing a successful run", async () => {
-    const fixture = createFixture();
+    const fixture = createFixture(mocks);
     const failure = new Error("backend detach failed");
     fixture.detachBackend.mockImplementationOnce(() => {
       fixture.order.push("detach-backend");
@@ -547,7 +750,7 @@ describe("runEmbeddedAttemptSettledPhase", () => {
   });
 
   it("reports active-run cleanup failure after detaching the backend", async () => {
-    const fixture = createFixture();
+    const fixture = createFixture(mocks);
     const failure = new Error("active run cleanup failed");
     mocks.clearActiveEmbeddedRun.mockImplementationOnce(() => {
       fixture.order.push("clear-active-run");
@@ -562,7 +765,7 @@ describe("runEmbeddedAttemptSettledPhase", () => {
   it.each([false, true])(
     "retains child receipts for logical-run settlement (yielded: %s)",
     async (yieldDetected) => {
-      const fixture = createFixture();
+      const fixture = createFixture(mocks);
       const acceptedSessionSpawns = [
         {
           runId: "child-run",
@@ -587,7 +790,7 @@ describe("runEmbeddedAttemptSettledPhase", () => {
   );
 
   it("defaults a source-less settlement failure without dropping it", async () => {
-    const fixture = createFixture();
+    const fixture = createFixture(mocks);
     const failure = new Error("settlement failed");
     mocks.settleStream.mockImplementationOnce(async () => {
       return {
