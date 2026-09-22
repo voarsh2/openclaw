@@ -38,6 +38,7 @@ import type {
   SessionTranscriptRuntimeTarget,
 } from "./session-accessor.types.js";
 import type { CanonicalSessionReaderContinuation } from "./session-canonical-key.js";
+import type { SessionColdArchive } from "./session-cold-storage-state.js";
 import type {
   SessionHistoryWorkerRequest,
   SessionHistoryWorkerResult,
@@ -166,6 +167,18 @@ type SessionTranscriptHydrationWorkerInput = {
   admission?: UserTurnTranscriptAdmissionReceipt;
 };
 
+export type SessionColdMetadataWorkerInput = {
+  kind: "cold-metadata";
+  database: { agentId: string; path: string };
+  sessionId: string;
+  env: NodeJS.ProcessEnv;
+};
+
+export type SessionColdMetadataWorkerResult = {
+  kind: "cold-metadata";
+  archive: Omit<SessionColdArchive, "archive_blob"> | undefined;
+};
+
 export type SessionRowPresenceWorkerInput = {
   kind: "session-row-presence";
   database: { agentId: string; path: string };
@@ -275,6 +288,7 @@ export type SessionBranchSummaryWorkerInput = {
 };
 
 export type SessionHistoryWorkerInput =
+  | SessionColdMetadataWorkerInput
   | SessionTranscriptHydrationWorkerInput
   | SessionTranscriptHistoryWorkerInput
   | SessionPreviewWorkerInput
@@ -306,6 +320,7 @@ export type SessionHistoryWorkerPreparedInput = {
 
 export type SessionTranscriptWorkerValues = {
   "transcript-search": SessionTranscriptSearchWorkerResult;
+  "cold-metadata": SessionColdMetadataWorkerResult;
   "transcript-hydration": SessionTranscriptHydrationWorkerResult;
   "sqlite-target": { target: ResolvedSqliteStoreTarget };
   "branch-summaries": SessionBranchSummaryReadResult;
@@ -347,6 +362,9 @@ export type SessionTranscriptWorkerReply<Kind extends keyof SessionTranscriptWor
     };
 
 export type SessionHistoryWorkerDatabase = {
+  readColdMetadata: (
+    input: Omit<SessionColdMetadataWorkerInput, "kind" | "database">,
+  ) => Promise<SessionColdMetadataWorkerResult>;
   searchTranscripts: (
     params: SessionTranscriptSearchWorkerInput["params"],
   ) => Promise<SessionTranscriptSearchWorkerResult["result"]>;

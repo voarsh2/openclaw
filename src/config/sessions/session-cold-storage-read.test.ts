@@ -14,6 +14,7 @@ beforeEach(() => vi.clearAllMocks());
 describe("readRestoredSessionTranscript", () => {
   it.each([false, true])("restores a cold read once (async=%s)", async (asynchronous) => {
     const cold = new SessionTranscriptColdError(scope.sessionId);
+    const coldRead = { target: scope, readMetadata: vi.fn(async () => undefined) };
     const read = vi
       .fn<() => string | Promise<string>>()
       .mockImplementationOnce(() => {
@@ -24,11 +25,13 @@ describe("readRestoredSessionTranscript", () => {
       })
       .mockReturnValue("retained text");
 
-    await expect(readRestoredSessionTranscript(scope, read)).resolves.toBe("retained text");
+    await expect(readRestoredSessionTranscript(scope, read, { coldRead })).resolves.toBe(
+      "retained text",
+    );
     expect(read).toHaveBeenCalledTimes(2);
     expect(restoreSessionColdTranscript).toHaveBeenCalledTimes(2);
-    expect(restoreSessionColdTranscript).toHaveBeenNthCalledWith(1, scope, undefined);
-    expect(restoreSessionColdTranscript).toHaveBeenNthCalledWith(2, scope, undefined);
+    expect(restoreSessionColdTranscript).toHaveBeenNthCalledWith(1, scope, undefined, coldRead);
+    expect(restoreSessionColdTranscript).toHaveBeenNthCalledWith(2, scope, undefined, coldRead);
   });
 
   it.each([new Error("read unavailable"), new SessionTranscriptColdError("another-transcript")])(
@@ -40,7 +43,11 @@ describe("readRestoredSessionTranscript", () => {
 
       await expect(readRestoredSessionTranscript(scope, read)).rejects.toBe(failure);
       expect(read).toHaveBeenCalledOnce();
-      expect(restoreSessionColdTranscript).toHaveBeenCalledExactlyOnceWith(scope, undefined);
+      expect(restoreSessionColdTranscript).toHaveBeenCalledExactlyOnceWith(
+        scope,
+        undefined,
+        undefined,
+      );
     },
   );
 
