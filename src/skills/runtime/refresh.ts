@@ -356,7 +356,7 @@ function createSkillsPathWatcher(
     const skillsRelevant = ancestorChanged || pathFilter.isRelevant(event, changedPath);
     if (skillsRelevant && (event === "addDir" || event === "unlinkDir")) {
       content?.structureChanged();
-      if (event === "addDir" && state.initialScan === "ready") {
+      if (event === "addDir") {
         content?.rescan();
       }
     }
@@ -429,7 +429,7 @@ function createSkillsPathWatcher(
     }
     log.warn(`skills watcher error (${target.path}): ${String(err)}`);
     // A failed scan may never emit ready. Let healthy roots reconcile; if the
-    // failed scan continues, its eventual ready still closes that read gap.
+    // failed content scan recovers, verified coverage closes that read gap.
     settleInitialScan("error");
     if (rescan) {
       schedule();

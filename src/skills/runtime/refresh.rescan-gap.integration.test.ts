@@ -7,6 +7,7 @@ import path from "node:path";
 import chokidar from "chokidar";
 import { expect, it, vi } from "vitest";
 import { createDeferredCore } from "../../shared/deferred.js";
+import { resolveWorkspaceSkillSourcePlan } from "../loading/workspace-skill-sources.js";
 import { resolveSkillsWatcherUsePolling } from "./refresh-watch-path.js";
 
 vi.mock("../loading/plugin-skills.js", () => ({
@@ -14,9 +15,7 @@ vi.mock("../loading/plugin-skills.js", () => ({
   resolvePluginSkillRootsFromMetadata: () => [],
 }));
 
-it.runIf(
-  process.platform === "linux" && !process.versions.bun && !resolveSkillsWatcherUsePolling(),
-)("keeps native coverage for a sibling created during a replacement root scan", async () => {
+async function verifyNativeCoverage(phase: "initial" | "replacement") {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "skills-rescan-")));
   const workspaceDir = path.join(root, "workspace");
   const skillsRoot = path.join(workspaceDir, "skills");
@@ -29,23 +28,23 @@ it.runIf(
   const read = () =>
     loadWorkspaceSkills(workspaceDir, {
       config: {},
+      workspaceOnly: true,
       bundledSkillsDir: "",
       managedSkillsDir: path.join(root, "unused"),
     }).map((entry) => entry.skill.name);
 
-  const generation = new AsyncLocalStorage<number>();
+  const contentScan = new AsyncLocalStorage<boolean>();
   const releaseScan = createDeferredCore();
   const watches: Array<{ ready: boolean; watcher: ReturnType<typeof chokidar.watch> }> = [];
   const errors: unknown[] = [];
-  let contentGeneration = 0;
+  let armed = phase === "initial";
   let snapshotCaptured = false;
   let snapshotContainsSecond = false;
   let nativeCreationObserved = false;
   const originalWatch = chokidar.watch;
   const watch = vi.spyOn(chokidar, "watch").mockImplementation((...args) => {
     const isContentRoot = args[0] === skillsRoot && (args[1]?.depth ?? 0) > 0;
-    const id = isContentRoot ? ++contentGeneration : 0;
-    return generation.run(id, () => {
+    return contentScan.run(isContentRoot, () => {
       const watcher = originalWatch(...args);
       const observation = { ready: false, watcher };
       watches.push(observation);
@@ -60,10 +59,12 @@ it.runIf(
   const readdir = vi.spyOn(fs, "readdir").mockImplementation(async (...args) => {
     const entries = await originalReaddir(...args);
     if (
-      generation.getStore() === 2 &&
+      armed &&
+      contentScan.getStore() &&
       path.resolve(String(args[0])) === skillsRoot &&
       !snapshotCaptured
     ) {
+      armed = false;
       // Preserve the real root listing, then create a sibling before this scan
       // can install its native watch. Only the observing generation can see it.
       snapshotContainsSecond = entries.some((entry) => String(entry.name) === "second");
@@ -131,14 +132,17 @@ it.runIf(
         nativeCreationObserved = true;
       }
     });
-    ensureSkillsWatcher({ workspaceDir, config: {} });
-    await vi.waitFor(() => {
-      expect(contentGeneration).toBe(1);
-      expect(watches.every(({ ready, watcher }) => ready || watcher.closed)).toBe(true);
-      expect(errors).toEqual([]);
+    ensureSkillsWatcher({
+      workspaceDir,
+      config: {},
+      sourcePlan: resolveWorkspaceSkillSourcePlan(workspaceDir, { workspaceOnly: true }),
     });
-    expect(read()).toEqual([]);
-    nativeFs.mkdirSync(firstDir);
+    if (phase === "replacement") {
+      await settleWatchers();
+      expect(read()).toEqual([]);
+      armed = true;
+      nativeFs.mkdirSync(firstDir);
+    }
     await expect.poll(() => snapshotCaptured, { timeout: 3_000 }).toBe(true);
     expect(snapshotContainsSecond).toBe(false);
 
@@ -173,4 +177,11 @@ it.runIf(
       await fs.rm(root, { recursive: true, force: true });
     }
   }
-});
+}
+
+it
+  .runIf(process.platform === "linux" && !process.versions.bun && !resolveSkillsWatcherUsePolling())
+  .each(["initial", "replacement"] as const)(
+  "keeps native coverage for a sibling created during the %s root scan",
+  verifyNativeCoverage,
+);

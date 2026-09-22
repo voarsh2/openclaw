@@ -29,12 +29,26 @@ describe("skills content rescan handoff", () => {
     watchMock.mockClear();
     createdWatchers.length = 0;
   });
-  const start = () => {
+  const acquire = () => {
     refresh.ensureSkillsWatcher({ workspaceDir: fixture.workspaceDir });
+    const root = path.join(fixture.workspaceDir, "skills");
+    const active = watchForSkillRoot(root).watcher;
+    for (const watcher of createdWatchers) {
+      if (watcher !== active) {
+        watcher.emit("ready");
+      }
+    }
+    return { root, active };
+  };
+  const start = (phase: "initial" | "replacement" = "replacement") => {
+    const { root, active: first } = acquire();
+    if (phase === "initial") {
+      first.emit("ready");
+      return { root, active: first, pending: watchForSkillRoot(root).watcher };
+    }
     for (const watcher of createdWatchers) {
       watcher.emit("ready");
     }
-    const root = path.join(fixture.workspaceDir, "skills");
     const active = watchForSkillRoot(root).watcher;
     active.emit("all", "addDir", path.join(root, "first"));
     const pending = watchForSkillRoot(root).watcher;
@@ -42,6 +56,76 @@ describe("skills content rescan handoff", () => {
     expect(active.closed).toBe(false);
     return { root, active, pending };
   };
+
+  it("publishes initial readiness only after a scan under continuous observation", () => {
+    const { root, active } = acquire();
+    const before = getSkillsSourceVersion(fixture.workspaceDir);
+    active.emit("ready");
+    const pending = watchForSkillRoot(root).watcher;
+    expect(pending).not.toBe(active);
+    expect(active.closed).toBe(false);
+    expect(getSkillsSourceVersion(fixture.workspaceDir)).toBe(before);
+    pending.emit("ready");
+    expect(active.closed).toBe(true);
+    expect(pending.closed).toBe(false);
+    const ready = getSkillsSourceVersion(fixture.workspaceDir);
+    expect(ready).toBeGreaterThan(before);
+    pending.emit("ready");
+    active.emit("ready");
+    expect(getSkillsSourceVersion(fixture.workspaceDir)).toBe(ready);
+  });
+
+  it("recovers an initial verification error on the next real directory wave", () => {
+    vi.useFakeTimers();
+    const { root, active, pending } = start("initial");
+    const before = getSkillsSourceVersion(fixture.workspaceDir);
+    pending.emit("error", Object.assign(new Error("scan failed"), { code: "EIO" }));
+    expect(active.closed).toBe(false);
+    expect(pending.closed).toBe(true);
+    const count = createdWatchers.length;
+    const failed = getSkillsSourceVersion(fixture.workspaceDir);
+    expect(failed).toBeGreaterThan(before);
+    pending.emit("ready");
+    expect(createdWatchers).toHaveLength(count);
+    expect(getSkillsSourceVersion(fixture.workspaceDir)).toBe(failed);
+    active.emit("all", "addDir", path.join(root, "second"));
+    const recovery = watchForSkillRoot(root).watcher;
+    expect(recovery).not.toBe(active);
+    recovery.emit("ready");
+    expect(active.closed).toBe(true);
+    expect(getSkillsSourceVersion(fixture.workspaceDir)).toBeGreaterThan(failed);
+  });
+
+  it.each([false, true])(
+    "verifies recovery after an initial read error (late ready=%s)",
+    async (lateReady) => {
+      vi.useFakeTimers();
+      const { root, active } = acquire();
+      active.emit("error", Object.assign(new Error("initial read failed"), { code: "EIO" }));
+      const failed = getSkillsSourceVersion(fixture.workspaceDir);
+      const changed = vi.fn();
+      refresh.registerSkillsChangeListener(changed);
+      if (lateReady) {
+        active.emit("ready");
+      } else {
+        const second = await fixture.createFixtureDirectory("workspace/skills/second");
+        active.emit("all", "addDir", second);
+      }
+      const healthy = watchForSkillRoot(root).watcher;
+      healthy.emit("ready");
+      const verification = watchForSkillRoot(root).watcher;
+      expect(verification).not.toBe(healthy);
+      expect(active.closed).toBe(true);
+      expect(healthy.closed).toBe(false);
+      expect(getSkillsSourceVersion(fixture.workspaceDir)).toBe(failed);
+      expect(changed).not.toHaveBeenCalled();
+      verification.emit("ready");
+      expect(healthy.closed).toBe(true);
+      expect(verification.closed).toBe(false);
+      expect(getSkillsSourceVersion(fixture.workspaceDir)).toBeGreaterThan(failed);
+      expect(changed).toHaveBeenCalledOnce();
+    },
+  );
 
   it.each(["native", "unknown-name", "polling"] as const)(
     "keeps coverage until a stable scan follows %s structural overlap",
@@ -76,7 +160,7 @@ describe("skills content rescan handoff", () => {
         watchMock.mock.calls.filter(
           ([watched, options]) => watched === root.replaceAll("\\", "/") && options.depth > 0,
         ),
-      ).toHaveLength(3);
+      ).toHaveLength(4);
       await vi.advanceTimersByTimeAsync(500);
     },
   );
@@ -108,7 +192,7 @@ describe("skills content rescan handoff", () => {
         watchMock.mock.calls.filter(
           ([watched, options]) => watched === root.replaceAll("\\", "/") && options.depth > 0,
         ),
-      ).toHaveLength(2);
+      ).toHaveLength(3);
     },
   );
 
@@ -131,11 +215,15 @@ describe("skills content rescan handoff", () => {
     expect(active.closed).toBe(true);
   });
 
-  it.each(["active", "pending"] as const)(
-    "falls back after native capacity failure from %s",
-    (source) => {
+  it.each(
+    (["initial", "replacement"] as const).flatMap((phase) =>
+      (["active", "pending"] as const).map((source) => ({ phase, source })),
+    ),
+  )(
+    "falls back after native capacity failure from $source during $phase coverage",
+    ({ phase, source }) => {
       vi.useFakeTimers();
-      const watches = start();
+      const watches = start(phase);
       watches[source].emit(
         "error",
         Object.assign(new Error("native capacity"), { code: "ENOSPC", syscall: "watch" }),
@@ -175,69 +263,75 @@ describe("skills content rescan handoff", () => {
     expect(pending.closed).toBe(true);
   });
 
-  it("joins the retired generation when publication closes all subscriptions", async () => {
-    vi.useFakeTimers();
-    const { active, pending } = start();
-    const release = createDeferredCore();
-    const close = active.close.getMockImplementation()!;
-    active.close.mockImplementation(async () => {
-      await close();
-      await release.promise;
-    });
-    let closing: Promise<void> | undefined;
-    let settled = false;
-    refresh.registerSkillsChangeListener((event) => {
-      if (event.workspaceDir === fixture.workspaceDir && event.reason === "watch") {
-        closing = refresh.closeSkillsWatchers().then(() => {
-          settled = true;
-        });
-      }
-    });
-    try {
-      pending.emit("ready");
-      await vi.advanceTimersByTimeAsync(0);
-      expect(closing).toBeDefined();
-      expect(settled).toBe(false);
-      expect(active.closed).toBe(true);
-      expect(pending.closed).toBe(true);
-      expect(active.close).toHaveBeenCalledOnce();
-      expect(pending.close).toHaveBeenCalledOnce();
-    } finally {
-      release.resolve();
-      await closing;
-    }
-    expect(settled).toBe(true);
-  });
-
-  it("joins both native closes and ignores late events during shutdown", async () => {
-    vi.useFakeTimers();
-    const { active, pending } = start();
-    const release = createDeferredCore();
-    for (const watcher of [active, pending]) {
-      const close = watcher.close.getMockImplementation()!;
-      watcher.close.mockImplementation(async () => {
+  it.each(["initial", "replacement"] as const)(
+    "joins the retired generation when %s publication closes all subscriptions",
+    async (phase) => {
+      vi.useFakeTimers();
+      const { active, pending } = start(phase);
+      const release = createDeferredCore();
+      const close = active.close.getMockImplementation()!;
+      active.close.mockImplementation(async () => {
         await close();
         await release.promise;
       });
-    }
-    let settled = false;
-    const closing = refresh.closeSkillsWatchers().then(() => {
-      settled = true;
-    });
-    try {
-      await vi.advanceTimersByTimeAsync(0);
-      expect(settled).toBe(false);
-      expect(active.closed).toBe(true);
-      expect(pending.closed).toBe(true);
-      const version = getSkillsSourceVersion(fixture.workspaceDir);
-      pending.emit("ready");
-      active.emit("all", "addDir", "late");
-      expect(() => pending.emit("error", new Error("late scan"))).not.toThrow();
-      expect(getSkillsSourceVersion(fixture.workspaceDir)).toBe(version);
-    } finally {
-      release.resolve();
-      await closing;
-    }
-    expect(settled).toBe(true);
-  });
+      let closing: Promise<void> | undefined;
+      let settled = false;
+      refresh.registerSkillsChangeListener((event) => {
+        if (event.workspaceDir === fixture.workspaceDir && event.reason === "watch") {
+          closing = refresh.closeSkillsWatchers().then(() => {
+            settled = true;
+          });
+        }
+      });
+      try {
+        pending.emit("ready");
+        await vi.advanceTimersByTimeAsync(0);
+        expect(closing).toBeDefined();
+        expect(settled).toBe(false);
+        expect(active.closed).toBe(true);
+        expect(pending.closed).toBe(true);
+        expect(active.close).toHaveBeenCalledOnce();
+        expect(pending.close).toHaveBeenCalledOnce();
+      } finally {
+        release.resolve();
+        await closing;
+      }
+      expect(settled).toBe(true);
+    },
+  );
+
+  it.each(["initial", "replacement"] as const)(
+    "joins both native closes and ignores late events during %s shutdown",
+    async (phase) => {
+      vi.useFakeTimers();
+      const { active, pending } = start(phase);
+      const release = createDeferredCore();
+      for (const watcher of [active, pending]) {
+        const close = watcher.close.getMockImplementation()!;
+        watcher.close.mockImplementation(async () => {
+          await close();
+          await release.promise;
+        });
+      }
+      let settled = false;
+      const closing = refresh.closeSkillsWatchers().then(() => {
+        settled = true;
+      });
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        expect(settled).toBe(false);
+        expect(active.closed).toBe(true);
+        expect(pending.closed).toBe(true);
+        const version = getSkillsSourceVersion(fixture.workspaceDir);
+        pending.emit("ready");
+        active.emit("all", "addDir", "late");
+        expect(() => pending.emit("error", new Error("late scan"))).not.toThrow();
+        expect(getSkillsSourceVersion(fixture.workspaceDir)).toBe(version);
+      } finally {
+        release.resolve();
+        await closing;
+      }
+      expect(settled).toBe(true);
+    },
+  );
 });

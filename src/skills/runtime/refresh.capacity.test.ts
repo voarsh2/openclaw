@@ -78,8 +78,13 @@ describe("ensureSkillsWatcher", () => {
       fail();
       await vi.advanceTimersByTimeAsync(250);
       expect(seen).toEqual([reconciliation]);
-      // Errors can also be recoverable: a later completed scan must catch up.
+      // A recovered scan first observes a verification; the failed scan alone
+      // cannot establish native coverage or publish initial readiness.
       failed.emit("ready");
+      expect(seen).toEqual([reconciliation]);
+      watchForSkillRoot(path.join(fixtureWorkspaceDir, "skills")).watcher.emit("ready");
+      expect(seen).toEqual([reconciliation]);
+      watchForSkillRoot(path.join(fixtureWorkspaceDir, "skills")).watcher.emit("ready");
       await vi.advanceTimersByTimeAsync(250);
       expect(seen).toEqual([reconciliation, reconciliation]);
     },

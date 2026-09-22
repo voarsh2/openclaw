@@ -1,7 +1,13 @@
 import type { FSWatcher } from "chokidar";
 import { teardownSkillsPathWatcher } from "./refresh-watch-close.js";
 
-type ContentWatchGeneration = { watcher: FSWatcher; revision: number; retired: boolean };
+type ContentWatchGeneration = {
+  watcher: FSWatcher;
+  revision: number;
+  ready: boolean;
+  errored: boolean;
+  retired: boolean;
+};
 
 /** Keep native coverage while a directory rescan establishes its replacement. */
 export function createSkillsContentWatcher(params: {
@@ -14,6 +20,7 @@ export function createSkillsContentWatcher(params: {
   error(error: unknown, rescan: boolean): void;
 }) {
   let closed = false;
+  let published = false;
   let revision = 0;
   let active: ContentWatchGeneration;
   let pending: ContentWatchGeneration | undefined;
@@ -27,19 +34,28 @@ export function createSkillsContentWatcher(params: {
     void teardownSkillsPathWatcher(generation);
   };
   const rescan = () => {
-    if (!closed && params.isCurrent() && !pending) {
+    if (!closed && params.isCurrent() && (active.ready || active.errored) && !pending) {
       pending = create();
     }
   };
   const create = (): ContentWatchGeneration => {
-    const generation = { watcher: params.watch(), revision, retired: false };
+    const generation = {
+      watcher: params.watch(),
+      revision,
+      ready: false,
+      errored: false,
+      retired: false,
+    };
     const { watcher } = generation;
     watcher.on("ready", () => {
-      if (!owns(generation)) {
+      if (!owns(generation) || generation.ready) {
         return;
       }
+      generation.ready = true;
       if (generation === active) {
-        params.ready(false);
+        // Chokidar lists before registering native watches. Verify that first
+        // listing under an observing generation before publishing readiness.
+        rescan();
         return;
       }
       pending = undefined;
@@ -55,7 +71,15 @@ export function createSkillsContentWatcher(params: {
       // Publication can synchronously close every watcher and snapshot the
       // native-close join set. Register retirement before handing control out.
       retire(previous);
-      params.ready(true);
+      if (previous.errored) {
+        // After an initial read error, finish a scan that can observe the
+        // verification. A failed scan alone never establishes coverage.
+        rescan();
+        return;
+      }
+      const isRescan = published;
+      published = true;
+      params.ready(isRescan);
     });
     watcher.on("all", (event, changedPath) => {
       if (owns(generation)) {
@@ -77,6 +101,7 @@ export function createSkillsContentWatcher(params: {
       if (!owns(generation)) {
         return;
       }
+      generation.errored = true;
       const isRescan = generation === pending;
       if (isRescan) {
         pending = undefined;
