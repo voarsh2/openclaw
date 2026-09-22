@@ -3,7 +3,6 @@ import path from "node:path";
 import { setImmediate } from "node:timers/promises";
 import { isDeepStrictEqual } from "node:util";
 import { getRuntimeConfig } from "../config/config.js";
-import { resolveStateDir } from "../config/paths.js";
 import {
   resolveTrajectoryPath,
   resolveTrajectoryPointerPath,
@@ -32,8 +31,6 @@ import {
 } from "../infra/deferred-plugin-session-sources.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { prepareLegacyAcpMigrationSource } from "../infra/legacy-acp-migration-source.js";
-import { isPathInside } from "../infra/path-guards.js";
-import { resolveSqliteDatabaseFilePaths } from "../infra/sqlite-files.js";
 import { LEGACY_IMPLICIT_AGENT_ID, normalizeAgentId } from "../routing/session-key.js";
 import { prepareActiveSqliteTranscriptSettlement } from "./doctor-session-sqlite-active.js";
 import {
@@ -99,6 +96,8 @@ import { settleDuplicateSessionSqliteArchives } from "./doctor-session-sqlite-re
 import {
   filterLegacySessionStoreTargets,
   resolveDoctorSessionSqliteTargets,
+  resolveDoctorSessionSqliteMaintenancePaths,
+  resolveDoctorSessionSqliteMaintenanceRoots,
 } from "./doctor-session-sqlite-targets.js";
 import {
   createDoctorSessionSqliteTargetReport,
@@ -157,12 +156,17 @@ export async function runDoctorSessionSqlite(
   const cfg = resolveDoctorSessionSqliteConfig(options);
   const pendingPlugins = readDeferredPluginMigrations({ env });
   const verifyMissingIndex = createMissingSessionIndexVerifier({ cfg, env });
-  const candidates = resolveDoctorSessionSqliteTargets({ ...options, cfg, env });
+  const discovery = resolveDoctorSessionSqliteTargets({ ...options, cfg, env });
+  const { targets: candidates, observedTargets } = discovery;
   if (isDestructiveDoctorSessionSqliteMode(options.mode)) {
     assertDoctorSqliteMaintenancePathsNotAliased(
       `session SQLite ${options.mode}`,
       resolveDoctorSessionSqliteMaintenancePaths(candidates),
       resolveDoctorSessionSqliteMaintenanceRoots(candidates, env),
+      {
+        paths: resolveDoctorSessionSqliteMaintenancePaths(observedTargets),
+        ownershipRoots: resolveDoctorSessionSqliteMaintenanceRoots(observedTargets, env),
+      },
     );
   }
   const settlements =
@@ -242,7 +246,7 @@ export async function runDoctorSessionSqlite(
           cfg,
           env,
           targets,
-          options.allAgents && !options.agent && !options.store ? candidates : undefined,
+          options.allAgents && !options.agent && !options.store ? observedTargets : undefined,
         )
       : undefined;
   const reports: DoctorSessionSqliteTargetReport[] = [];
@@ -589,64 +593,21 @@ export async function reconcileDoctorSessionSqlitePublication(
 ): Promise<void> {
   const env = options.env ?? process.env;
   const cfg = resolveDoctorSessionSqliteConfig(options);
-  const targets = resolveDoctorSessionSqliteTargets({ ...options, cfg, env });
+  const { targets, observedTargets } = resolveDoctorSessionSqliteTargets({ ...options, cfg, env });
   assertDoctorSqliteMaintenancePathsNotAliased(
     `session SQLite ${options.mode}`,
     resolveDoctorSessionSqliteMaintenancePaths(targets),
     resolveDoctorSessionSqliteMaintenanceRoots(targets, env),
+    {
+      paths: resolveDoctorSessionSqliteMaintenancePaths(observedTargets),
+      ownershipRoots: resolveDoctorSessionSqliteMaintenanceRoots(observedTargets, env),
+    },
   );
   await reconcileSessionSqliteMigrationPublications({
     env,
     sourcePath,
     trustedTargets: targets.map(createMigrationTargetInput),
   });
-}
-
-function resolveDoctorSessionSqliteMaintenancePaths(
-  targets: readonly SessionStoreTarget[],
-): string[] {
-  const protectedPaths = new Set<string>();
-  for (const target of targets) {
-    for (const databasePath of resolveSqliteDatabaseFilePaths(resolveTargetSqlitePath(target))) {
-      protectedPaths.add(databasePath);
-    }
-  }
-  return [...protectedPaths];
-}
-
-function resolveDoctorSessionSqliteMaintenanceRoots(
-  targets: readonly SessionStoreTarget[],
-  env: NodeJS.ProcessEnv,
-): string[] {
-  const stateDir = path.resolve(resolveStateDir(env));
-  const roots = new Set([stateDir]);
-  for (const target of targets) {
-    const sqlitePath = resolveTargetSqlitePath(target);
-    if (isPathWithin(stateDir, target.storePath) && isPathWithin(stateDir, sqlitePath)) {
-      continue;
-    }
-    const commonRoot = commonPathAncestor(path.dirname(target.storePath), path.dirname(sqlitePath));
-    const parentRoot = path.dirname(commonRoot);
-    roots.add(parentRoot === path.parse(commonRoot).root ? commonRoot : parentRoot);
-  }
-  return [...roots];
-}
-
-function isPathWithin(rootPath: string, candidatePath: string): boolean {
-  return isPathInside(rootPath, path.resolve(candidatePath));
-}
-
-function commonPathAncestor(leftPath: string, rightPath: string): string {
-  let currentPath = path.resolve(leftPath);
-  const resolvedRightPath = path.resolve(rightPath);
-  while (!isPathWithin(currentPath, resolvedRightPath)) {
-    const parentPath = path.dirname(currentPath);
-    if (parentPath === currentPath) {
-      return currentPath;
-    }
-    currentPath = parentPath;
-  }
-  return currentPath;
 }
 
 // Direct store migrations are scoped by path; broader agent discovery needs runtime config.

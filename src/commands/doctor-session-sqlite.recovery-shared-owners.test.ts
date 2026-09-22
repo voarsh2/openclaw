@@ -1,7 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
+import {
+  beginAgentDeletionJournal,
+  completeAgentDeletionJournalInDatabase,
+} from "../state/agent-deletion-journal.js";
+import {
+  closeOpenClawAgentDatabasesForTest,
+  openOpenClawAgentDatabase,
+} from "../state/openclaw-agent-db.js";
+import { runOpenClawStateWriteTransaction } from "../state/openclaw-state-db.js";
 import * as sqliteReaders from "./doctor-session-sqlite-readers.js";
 import { inspectSessionSqliteRecovery } from "./doctor-session-sqlite-recovery-inventory.js";
 import { retireSessionSqliteRecovery } from "./doctor-session-sqlite-retirement.js";
@@ -139,9 +147,16 @@ describe("runDoctorSessionSqlite", () => {
     },
   );
 
-  it.each(["shared", "distinct", "unreadable", "invalid-entry"] as const)(
-    "retains known unselected index recovery (%s)",
-    async (coverage) => {
+  it.each([
+    { coverage: "shared", held: false },
+    { coverage: "distinct", held: false },
+    { coverage: "unreadable", held: false },
+    { coverage: "invalid-entry", held: false },
+    { coverage: "shared", held: true },
+    { coverage: "unreadable", held: true },
+  ] as const)(
+    "retains known unselected index recovery ($coverage, held=$held)",
+    async ({ coverage, held }) => {
       const { cfg, env, indexes, transcriptPath } = createSharedRecoveryFixture({
         separateIndexes: true,
         reverse: false,
@@ -172,7 +187,35 @@ describe("runDoctorSessionSqlite", () => {
       }
       const original = fs.readFileSync(workSource);
       const indexBytes = fs.readFileSync(workIndex);
-      const report = await runDoctorSessionSqlite({ cfg, env, agent: "main", mode: "import" });
+      if (held) {
+        const databasePath = sqliteReaders.resolveTargetSqlitePath(
+          { agentId: "work", storePath: workIndex },
+          env,
+        );
+        openOpenClawAgentDatabase({ agentId: "work", path: databasePath, env });
+        beginAgentDeletionJournal(
+          {
+            agentId: "work",
+            operationId: "retain-work",
+            agentDir: path.dirname(databasePath),
+            workspaceDir: path.join(env.OPENCLAW_STATE_DIR!, "workspace-work"),
+            sessionsDir: path.dirname(workIndex),
+            deleteFiles: false,
+          },
+          { env },
+        );
+        runOpenClawStateWriteTransaction(
+          (database) => completeAgentDeletionJournalInDatabase(database, "work", "retain-work"),
+          { env },
+        );
+        closeOpenClawAgentDatabasesForTest();
+      }
+      const report = await runDoctorSessionSqlite({
+        cfg,
+        env,
+        ...(held ? { allAgents: true } : { agent: "main" }),
+        mode: "import",
+      });
       closeOpenClawAgentDatabasesForTest();
       const cleanup = await retireSessionSqliteRecovery({
         env,
@@ -183,7 +226,11 @@ describe("runDoctorSessionSqlite", () => {
       expect(fs.existsSync(workSource)).toBe(true);
       expect(fs.readFileSync(workSource)).toEqual(original);
       expect(fs.readFileSync(workIndex)).toEqual(indexBytes);
-      expect(cleanup.totals.removedFiles).toBe(coverage === "distinct" ? 3 : 0);
+      if (held) {
+        expect(report.targets.map((target) => target.agentId)).not.toContain("work");
+      } else {
+        expect(cleanup.totals.removedFiles).toBe(coverage === "distinct" ? 3 : 0);
+      }
       if (coverage !== "distinct") {
         expect(report.targets[0]?.issues).toEqual(
           expect.arrayContaining([
@@ -196,7 +243,7 @@ describe("runDoctorSessionSqlite", () => {
       if (coverage !== "distinct") {
         expect(fs.existsSync(siblingSource)).toBe(true);
       }
-      if (coverage === "shared") {
+      if (coverage === "shared" && !held) {
         const retry = await runDoctorSessionSqlite({ cfg, env, allAgents: true, mode: "import" });
         expect(retry.targets.flatMap((target) => target.issues)).toEqual([]);
         closeOpenClawAgentDatabasesForTest();

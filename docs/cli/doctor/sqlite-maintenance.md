@@ -282,6 +282,12 @@ the store's owning state directory before maintaining another installation.
 Existing hard-linked targets are rejected because another path can share the
 same database inode outside the locked state directory. The same ownership
 checks cover SQLite WAL, shared-memory, and rollback-journal sidecars.
+Automatic all-agent maintenance excludes databases retained after agent deletion
+from its mutation targets. Their discovered paths still participate in symbolic-link
+checks before import or archive settlement, because a retained path can point into
+a selected database or sidecar. Known retained legacy indexes also keep their
+referenced originals in place; an unreadable index prevents treating its directory
+as fully covered by the import.
 
 Each import writes a manifest under
 `~/.openclaw/session-sqlite-migration-runs/` before moving transcript artifacts

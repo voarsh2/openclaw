@@ -12,6 +12,8 @@ import {
   type SessionStoreTarget as ResolvedSessionStoreTarget,
 } from "../config/sessions/targets.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { isPathInside } from "../infra/path-guards.js";
+import { resolveSqliteDatabaseFilePaths } from "../infra/sqlite-files.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import { createAgentDatabaseDeletionClassifier } from "../state/agent-deletion-discovery.js";
 import { readAgentDatabaseDeletionSnapshot } from "../state/agent-deletion-journal.read.js";
@@ -29,9 +31,14 @@ export function resolveDoctorSessionSqliteTargets(params: {
   env: NodeJS.ProcessEnv;
   mode: DoctorSessionSqliteMode;
   store?: string;
-}): SessionStoreTarget[] {
+}): { targets: SessionStoreTarget[]; observedTargets: SessionStoreTarget[] } {
   if (params.store) {
-    return resolveSessionStoreTargets(params.cfg, { store: params.store }, { env: params.env });
+    const targets = resolveSessionStoreTargets(
+      params.cfg,
+      { store: params.store },
+      { env: params.env },
+    );
+    return { targets, observedTargets: targets };
   }
   const discoversHistory =
     params.mode === "dry-run" || params.mode === "import" || params.mode === "validate";
@@ -44,13 +51,19 @@ export function resolveDoctorSessionSqliteTargets(params: {
       env: params.env,
     });
     if (!params.agent) {
-      return candidates;
+      return { targets: candidates, observedTargets: candidates };
     }
     const requestedAgentId = normalizeAgentId(params.agent);
-    return candidates.filter((target) => normalizeAgentId(target.agentId) === requestedAgentId);
+    const targets = candidates.filter(
+      (target) => normalizeAgentId(target.agentId) === requestedAgentId,
+    );
+    return { targets, observedTargets: targets };
   }
   if (params.agent) {
-    return resolveAgentSessionStoreTargetsSync(params.cfg, params.agent, { env: params.env });
+    const targets = resolveAgentSessionStoreTargetsSync(params.cfg, params.agent, {
+      env: params.env,
+    });
+    return { targets, observedTargets: targets };
   }
   if (params.allAgents) {
     // Discovery must admit validated directories even before either registry exists.
@@ -80,13 +93,17 @@ export function resolveDoctorSessionSqliteTargets(params: {
           env: params.env,
         }),
       });
-    return [...legacyTargets, ...candidates].filter(
+    // Held stores still contribute aliases and references, even though maintenance cannot select them.
+    const observedTargets = [...legacyTargets, ...candidates];
+    const targets = observedTargets.filter(
       (target) =>
         !isRetained?.(target.storePath, target.agentId) &&
         !isRetained?.(resolveTargetSqlitePath(target, params.env), target.agentId),
     );
+    return { targets, observedTargets };
   }
-  return resolveSessionStoreTargets(params.cfg, {}, { env: params.env });
+  const targets = resolveSessionStoreTargets(params.cfg, {}, { env: params.env });
+  return { targets, observedTargets: targets };
 }
 
 export function filterLegacySessionStoreTargets(
@@ -108,4 +125,51 @@ export function filterLegacySessionStoreTargets(
         (fs.existsSync(path.dirname(target.storePath)) &&
           fs.readdirSync(path.dirname(target.storePath)).some(isPrimarySessionTranscriptFileName))),
   );
+}
+
+export function resolveDoctorSessionSqliteMaintenancePaths(
+  targets: readonly SessionStoreTarget[],
+): string[] {
+  const protectedPaths = new Set<string>();
+  for (const target of targets) {
+    for (const databasePath of resolveSqliteDatabaseFilePaths(resolveTargetSqlitePath(target))) {
+      protectedPaths.add(databasePath);
+    }
+  }
+  return [...protectedPaths];
+}
+
+export function resolveDoctorSessionSqliteMaintenanceRoots(
+  targets: readonly SessionStoreTarget[],
+  env: NodeJS.ProcessEnv,
+): string[] {
+  const stateDir = path.resolve(resolveStateDir(env));
+  const roots = new Set([stateDir]);
+  for (const target of targets) {
+    const sqlitePath = resolveTargetSqlitePath(target);
+    if (isPathWithin(stateDir, target.storePath) && isPathWithin(stateDir, sqlitePath)) {
+      continue;
+    }
+    const commonRoot = commonPathAncestor(path.dirname(target.storePath), path.dirname(sqlitePath));
+    const parentRoot = path.dirname(commonRoot);
+    roots.add(parentRoot === path.parse(commonRoot).root ? commonRoot : parentRoot);
+  }
+  return [...roots];
+}
+
+function isPathWithin(rootPath: string, candidatePath: string): boolean {
+  return isPathInside(rootPath, path.resolve(candidatePath));
+}
+
+function commonPathAncestor(leftPath: string, rightPath: string): string {
+  let currentPath = path.resolve(leftPath);
+  const resolvedRightPath = path.resolve(rightPath);
+  while (!isPathWithin(currentPath, resolvedRightPath)) {
+    const parentPath = path.dirname(currentPath);
+    if (parentPath === currentPath) {
+      return currentPath;
+    }
+    currentPath = parentPath;
+  }
+  return currentPath;
 }

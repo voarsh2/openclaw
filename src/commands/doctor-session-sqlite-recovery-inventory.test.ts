@@ -3,6 +3,15 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { describe, expect, it, vi } from "vitest";
 import {
+  beginAgentDeletionJournal,
+  completeAgentDeletionJournalInDatabase,
+} from "../state/agent-deletion-journal.js";
+import {
+  closeOpenClawAgentDatabasesForTest,
+  openOpenClawAgentDatabase,
+} from "../state/openclaw-agent-db.js";
+import { runOpenClawStateWriteTransaction } from "../state/openclaw-state-db.js";
+import {
   withOpenClawTestState,
   type OpenClawTestState,
 } from "../test-utils/openclaw-test-state.js";
@@ -28,7 +37,10 @@ import {
   type RecoveryArtifactReference,
   type RecoveryCleanupReport,
 } from "./doctor-session-sqlite-recovery-inventory.js";
-import { runDoctorSessionSqlite } from "./doctor-session-sqlite.js";
+import {
+  reconcileDoctorSessionSqlitePublication,
+  runDoctorSessionSqlite,
+} from "./doctor-session-sqlite.js";
 
 function recoveryGraph(transcripts: number) {
   const target: SessionSqliteMigrationTargetManifest = {
@@ -73,7 +85,7 @@ function recoveryGraph(transcripts: number) {
   return { target, refs, artifacts };
 }
 
-function createRetainedDuplicateArchives(state: OpenClawTestState) {
+function createRetainedDuplicateArchives(state: OpenClawTestState, message?: string) {
   const sessions = state.sessionsDir();
   fs.mkdirSync(sessions, { recursive: true });
   const storePath = path.join(sessions, "sessions.json");
@@ -84,7 +96,11 @@ function createRetainedDuplicateArchives(state: OpenClawTestState) {
   };
   const archiveDir = path.join(path.dirname(sessions), "session-sqlite-import-archive");
   fs.mkdirSync(archiveDir);
-  const bytes = `${JSON.stringify({ type: "session", id: "duplicate", version: 3, timestamp: "2026-09-01T00:00:00Z", cwd: "/synthetic" })}\n`;
+  const bytes =
+    `${JSON.stringify({ type: "session", id: "duplicate", version: 3, timestamp: "2026-09-01T00:00:00Z", cwd: "/synthetic" })}\n` +
+    (message
+      ? `${JSON.stringify({ type: "message", id: "user", parentId: null, timestamp: "2026-09-01T00:00:01Z", message: { role: "user", content: message } })}\n`
+      : "");
   const moves: SessionSqliteMigrationMove[] = [];
   const archives = [1, 2].map((copy) => {
     const archivePath = path.join(archiveDir, `duplicate.jsonl.imported-${copy}`);
@@ -114,6 +130,125 @@ function createRetainedDuplicateArchives(state: OpenClawTestState) {
 }
 
 describe("recovery dependency inventory", () => {
+  it.skipIf(process.platform === "win32").each(["import", "publication"] as const)(
+    "retains selected ancestor checks before %s when held targets add a narrower root",
+    async (entrypoint) => {
+      await withOpenClawTestState({ label: "doctor-held-root-order" }, async (state) => {
+        const physical = state.path("physical");
+        const external = state.path("external");
+        fs.mkdirSync(physical);
+        fs.symlinkSync(physical, external, "dir");
+        const activeState = path.join(external, "held", "state");
+        const globalStore = path.join(activeState, "sessions", "sessions.json");
+        fs.mkdirSync(path.dirname(globalStore), { recursive: true });
+        fs.writeFileSync(globalStore, "{}\n");
+        for (const agentId of ["held", "main"]) {
+          fs.mkdirSync(path.join(external, agentId), { recursive: true });
+          fs.writeFileSync(path.join(external, agentId, "sessions.json"), "{}\n");
+        }
+        const env = { ...state.env, OPENCLAW_STATE_DIR: activeState };
+        process.env.OPENCLAW_STATE_DIR = activeState;
+        const cfg = {
+          agents: {
+            ownership: "explicit" as const,
+            entries: { held: {}, main: { default: true } },
+          },
+          session: { store: path.join(external, "{agentId}", "sessions.json") },
+        };
+        const heldStore = path.join(external, "held", "sessions.json");
+        const heldDatabase = resolveTargetSqlitePath(
+          { agentId: "held", storePath: heldStore },
+          env,
+        );
+        openOpenClawAgentDatabase({ agentId: "held", path: heldDatabase, env });
+        beginAgentDeletionJournal(
+          {
+            agentId: "held",
+            operationId: "retain-held",
+            agentDir: path.dirname(heldDatabase),
+            workspaceDir: state.path("workspace-held"),
+            sessionsDir: path.dirname(heldStore),
+            deleteFiles: false,
+          },
+          { env },
+        );
+        runOpenClawStateWriteTransaction(
+          (database) => completeAgentDeletionJournalInDatabase(database, "held", "retain-held"),
+          { env },
+        );
+        closeOpenClawAgentDatabasesForTest();
+        const selectedStore = path.join(external, "main", "sessions.json");
+        const selectedDatabase = resolveTargetSqlitePath(
+          { agentId: "main", storePath: selectedStore },
+          env,
+        );
+        const options = { cfg, env, allAgents: true, mode: "import" as const };
+        await expect(
+          entrypoint === "import"
+            ? runDoctorSessionSqlite(options)
+            : reconcileDoctorSessionSqlitePublication(options, selectedDatabase),
+        ).rejects.toThrow(`symbolic-link path component: ${external}`);
+        for (const store of [globalStore, heldStore, selectedStore]) {
+          expect(fs.readFileSync(store, "utf8")).toBe("{}\n");
+        }
+        expect(fs.existsSync(selectedDatabase)).toBe(false);
+      });
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "refuses a held database symlink into selected sidecars before archive settlement",
+    async () => {
+      await withOpenClawTestState({ label: "doctor-held-sidecar-symlink" }, async (state) => {
+        const { target, archives } = createRetainedDuplicateArchives(state, "selected history");
+        openOpenClawAgentDatabase({ agentId: "main", path: target.sqlitePath, env: state.env });
+        const held = path.join(state.agentDir("retired"), "openclaw-agent.sqlite");
+        openOpenClawAgentDatabase({ agentId: "retired", path: held, env: state.env });
+        beginAgentDeletionJournal(
+          {
+            agentId: "retired",
+            operationId: "retain-retired",
+            agentDir: state.agentDir("retired"),
+            workspaceDir: state.path("retired-workspace"),
+            sessionsDir: state.sessionsDir("retired"),
+            deleteFiles: false,
+          },
+          { env: state.env },
+        );
+        runOpenClawStateWriteTransaction(
+          (database) =>
+            completeAgentDeletionJournalInDatabase(database, "retired", "retain-retired"),
+          { env: state.env },
+        );
+        closeOpenClawAgentDatabasesForTest();
+        const sidecar = `${target.sqlitePath}-journal`;
+        fs.writeFileSync(sidecar, Buffer.alloc(512));
+        fs.unlinkSync(held);
+        fs.symlinkSync(sidecar, held);
+        const inventory = collectRecoveryInventory({ cfg: {}, env: state.env });
+        const originals = new Map(
+          [...archives, ...inventory.manifestPaths, sidecar, held].map((file) => [
+            file,
+            fs.readFileSync(file),
+          ]),
+        );
+
+        await expect(
+          runDoctorSessionSqlite({
+            mode: "import",
+            allAgents: true,
+            cfg: { agents: { ownership: "explicit", entries: { main: {} } } },
+            env: state.env,
+          }),
+        ).rejects.toThrow("symbolic-link");
+        for (const [file, bytes] of originals) {
+          expect(fs.readFileSync(file)).toEqual(bytes);
+        }
+        expect(fs.lstatSync(held).isSymbolicLink()).toBe(true);
+      });
+    },
+  );
+
   it("preserves the latest failed run's rollback when duplicate references are coalesced", async () => {
     await withOpenClawTestState({ label: "doctor-duplicate-restore-first" }, async (state) => {
       const { storePath, target, bytes, moves } = createRetainedDuplicateArchives(state);

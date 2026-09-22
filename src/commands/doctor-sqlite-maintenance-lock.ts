@@ -93,16 +93,30 @@ async function assertMaintenancePathsOwnedByStateDir(
   assertDoctorSqliteMaintenancePathsNotAliased(operation, protectedPaths, [stateDir]);
 }
 
-/** Reject file aliases that destructive SQLite maintenance would mutate in place. */
+/** Protect writes and retain observed symbolic routes into files selected for maintenance. */
 export function assertDoctorSqliteMaintenancePathsNotAliased(
   operation: string,
   protectedPaths: readonly string[],
   ownershipRoots: readonly string[] = [],
+  observations?: { paths: readonly string[]; ownershipRoots: readonly string[] },
 ): void {
   const resolvedRoots = ownershipRoots.map((candidate) => path.resolve(candidate));
-  for (const protectedPath of new Set(protectedPaths.map((candidate) => path.resolve(candidate)))) {
-    const stat = inspectMaintenancePath(operation, protectedPath, resolvedRoots);
-    if (stat?.isFile() && stat.nlink > 1) {
+  const observationRoots =
+    observations?.ownershipRoots.map((candidate) => path.resolve(candidate)) ?? [];
+  const mutationPaths = new Set(protectedPaths.map((candidate) => path.resolve(candidate)));
+  const paths = new Set([
+    ...mutationPaths,
+    ...(observations?.paths ?? []).map((candidate) => path.resolve(candidate)),
+  ]);
+  for (const protectedPath of paths) {
+    // A held observation must not replace the first root protecting a selected mutation path.
+    const mutating = mutationPaths.has(protectedPath);
+    const stat = inspectMaintenancePath(
+      operation,
+      protectedPath,
+      mutating ? resolvedRoots : observationRoots,
+    );
+    if (mutating && stat?.isFile() && stat.nlink > 1) {
       throw new Error(
         `Cannot run ${operation} for a hard-linked path: ${protectedPath}. Remove the additional hard link and retry.`,
       );
