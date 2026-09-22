@@ -1,7 +1,9 @@
 import path from "node:path";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferredCore } from "../../shared/deferred.js";
-import { getSkillsSourceVersion } from "./refresh-state.js";
+import { writeSkill } from "../test-support/e2e-test-helpers.js";
+import type { SkillSnapshot } from "../types.js";
+import { getSkillsSnapshotVersion, getSkillsSourceVersion } from "./refresh-state.js";
 import {
   createSkillsWatcherMock,
   useSkillsWatcherFixture,
@@ -75,6 +77,38 @@ describe("skills content rescan handoff", () => {
     expect(getSkillsSourceVersion(fixture.workspaceDir)).toBe(ready);
   });
 
+  it.each(["initial", "replacement"] as const)(
+    "verifies every expanding directory inventory during %s coverage",
+    (phase) => {
+      const { root, active, pending } = start(phase);
+      const before = getSkillsSourceVersion(fixture.workspaceDir);
+      // The observer can discover these after its first ready. Its mutable
+      // inventory cannot prove their watches predated the verifier's listing.
+      const directories: Record<string, string[]> = { [root]: ["outer"] };
+      active.getWatched.mockReturnValue(directories);
+      pending.getWatched.mockReturnValue(directories);
+      let observer = active;
+      let verifier = pending;
+      for (const directory of [root, path.join(root, "outer"), path.join(root, "outer", "inner")]) {
+        directories[directory] = [];
+        verifier.emit("ready");
+        expect(observer.closed).toBe(true);
+        expect(verifier.closed).toBe(false);
+        expect(getSkillsSourceVersion(fixture.workspaceDir)).toBe(before);
+        observer = verifier;
+        verifier = watchForSkillRoot(root).watcher;
+        expect(verifier).not.toBe(observer);
+        verifier.getWatched.mockReturnValue(directories);
+      }
+      verifier.emit("ready");
+      expect(observer.closed).toBe(true);
+      expect(verifier.closed).toBe(false);
+      expect(getSkillsSourceVersion(fixture.workspaceDir)).toBeGreaterThan(before);
+      expect(active.getWatched).toHaveBeenCalledOnce();
+      expect(pending.getWatched).toHaveBeenCalledOnce();
+    },
+  );
+
   it("recovers an initial verification error on the next real directory wave", () => {
     vi.useFakeTimers();
     const { root, active, pending } = start("initial");
@@ -95,6 +129,133 @@ describe("skills content rescan handoff", () => {
     expect(active.closed).toBe(true);
     expect(getSkillsSourceVersion(fixture.workspaceDir)).toBeGreaterThan(failed);
   });
+
+  it.each(["workspace", "shared", "execution"] as const)(
+    "reconciles only affected %s sources during preparation after a verification error",
+    async (scope) => {
+      const { resolveReusableWorkspaceSkillSnapshot } = await import("./session-snapshot.js");
+      const workspaceDir = fixture.workspaceDir;
+      const healthyWorkspace = await fixture.createFixtureDirectory("healthy-workspace");
+      const sharedRoot = await fixture.createFixtureDirectory("shared/skills");
+      const executionWorkspaceDir = await fixture.createFixtureDirectory("execution");
+      const otherExecution = await fixture.createFixtureDirectory("other-execution");
+      const config = scope === "shared" ? { skills: { load: { extraDirs: [sharedRoot] } } } : {};
+      const root =
+        scope === "shared"
+          ? sharedRoot
+          : path.join(scope === "execution" ? executionWorkspaceDir : workspaceDir, "skills");
+      const write = (description: string) =>
+        writeSkill({ dir: path.join(root, "scan-proof"), name: "scan-proof", description });
+      await write("Original verified preparation");
+      const request = {
+        workspaceDir,
+        config,
+        ...(scope === "execution" ? { executionWorkspaceDir } : {}),
+      };
+      const affected = [
+        request,
+        ...(scope === "shared"
+          ? [{ workspaceDir: await fixture.createFixtureDirectory("shared-subscriber"), config }]
+          : []),
+      ];
+      const snapshots = new Map<string, SkillSnapshot>();
+      const prepare = async (params: typeof request) => {
+        const key = JSON.stringify(params);
+        const { snapshot } = await resolveReusableWorkspaceSkillSnapshot({
+          ...params,
+          existingSnapshot: snapshots.get(key),
+          skillFilter: ["scan-proof"],
+        });
+        snapshots.set(key, snapshot);
+        return snapshot;
+      };
+      for (const params of affected) {
+        expect((await prepare(params)).prompt).toContain("Original verified preparation");
+      }
+      const healthy = { workspaceDir: healthyWorkspace, config: {} };
+      const healthySnapshot = await prepare(healthy);
+      if (scope === "execution") {
+        await prepare({ workspaceDir, config });
+        await prepare({ workspaceDir, config, executionWorkspaceDir: otherExecution });
+      }
+      const active = watchForSkillRoot(root).watcher;
+      for (const watcher of createdWatchers) {
+        if (watcher !== active) {
+          watcher.emit("ready");
+        }
+      }
+      active.emit("ready");
+      const pending = watchForSkillRoot(root).watcher;
+      const unaffected = [
+        getSkillsSourceVersion(healthyWorkspace),
+        getSkillsSourceVersion(workspaceDir),
+        getSkillsSourceVersion(workspaceDir, { executionWorkspaceDir: otherExecution }),
+      ];
+      vi.useFakeTimers();
+      pending.emit("error", Object.assign(new Error("verifier read failed"), { code: "EIO" }));
+      expect(active.closed).toBe(false);
+      expect(pending.closed).toBe(true);
+      const watcherCount = createdWatchers.length;
+      for (const description of ["Second preparation", "Third preparation"]) {
+        await write(description);
+        for (const params of affected) {
+          expect((await prepare(params)).prompt).toContain(description);
+        }
+        expect(await prepare(healthy)).toBe(healthySnapshot);
+      }
+      expect(getSkillsSourceVersion(healthyWorkspace)).toBe(unaffected[0]);
+      if (scope === "execution") {
+        expect(getSkillsSourceVersion(workspaceDir)).toBe(unaffected[1]);
+        expect(
+          getSkillsSourceVersion(workspaceDir, { executionWorkspaceDir: otherExecution }),
+        ).toBe(unaffected[2]);
+      }
+      const seen = vi.fn();
+      refresh.registerSkillsChangeListener(seen);
+      const version = getSkillsSnapshotVersion(workspaceDir);
+      await prepare(request);
+      await prepare(request);
+      expect(getSkillsSnapshotVersion(workspaceDir)).toBe(version);
+      expect(seen).not.toHaveBeenCalled();
+      expect(createdWatchers).toHaveLength(watcherCount);
+
+      if (scope === "shared") {
+        const late = {
+          workspaceDir: await fixture.createFixtureDirectory("late-subscriber"),
+          config,
+        };
+        await prepare(late);
+        expect(seen).toHaveBeenCalledExactlyOnceWith({
+          workspaceDir: late.workspaceDir,
+          reason: "watch-unavailable",
+          changedPath: expect.any(String),
+        });
+        seen.mockClear();
+        await prepare(late);
+        expect(seen).not.toHaveBeenCalled();
+        for (const watcher of createdWatchers) {
+          if (watcher !== active) {
+            watcher.emit("ready");
+          }
+        }
+      }
+
+      const added = await fixture.createFixtureDirectory(
+        scope === "shared"
+          ? "shared/skills/recovered"
+          : `${scope === "execution" ? "execution" : "workspace"}/skills/recovered`,
+      );
+      active.emit("all", "addDir", added);
+      const recovery = watchForSkillRoot(root).watcher;
+      recovery.emit("ready");
+      expect(active.closed).toBe(true);
+      expect(recovery.closed).toBe(false);
+      await vi.advanceTimersByTimeAsync(500);
+      const readyVersion = getSkillsSourceVersion(workspaceDir, request);
+      await prepare(request);
+      expect(getSkillsSourceVersion(workspaceDir, request)).toBe(readyVersion);
+    },
+  );
 
   it.each([false, true])(
     "verifies recovery after an initial read error (late ready=%s)",

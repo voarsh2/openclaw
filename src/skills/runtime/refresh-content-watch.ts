@@ -5,6 +5,7 @@ type ContentWatchGeneration = {
   watcher: FSWatcher;
   revision: number;
   ready: boolean;
+  readyDirectories: ReadonlySet<string>;
   errored: boolean;
   retired: boolean;
 };
@@ -39,10 +40,11 @@ export function createSkillsContentWatcher(params: {
     }
   };
   const create = (): ContentWatchGeneration => {
-    const generation = {
+    const generation: ContentWatchGeneration = {
       watcher: params.watch(),
       revision,
       ready: false,
+      readyDirectories: new Set(),
       errored: false,
       retired: false,
     };
@@ -52,6 +54,10 @@ export function createSkillsContentWatcher(params: {
         return;
       }
       generation.ready = true;
+      // Later discovery cannot prove a directory was observed before verification.
+      // Identical watch options make all getWatched keys a conservative inventory,
+      // including bookkeeping parents; this is not a native-handle census.
+      generation.readyDirectories = new Set(Object.keys(watcher.getWatched()));
       if (generation === active) {
         // Chokidar lists before registering native watches. Verify that first
         // listing under an observing generation before publishing readiness.
@@ -71,9 +77,14 @@ export function createSkillsContentWatcher(params: {
       // Publication can synchronously close every watcher and snapshot the
       // native-close join set. Register retirement before handing control out.
       retire(previous);
-      if (previous.errored) {
-        // After an initial read error, finish a scan that can observe the
-        // verification. A failed scan alone never establishes coverage.
+      if (
+        previous.errored ||
+        Array.from(generation.readyDirectories).some(
+          (directory) => !previous.readyDirectories.has(directory),
+        )
+      ) {
+        // A newly discovered directory has its own list-before-watch gap.
+        // Establish its observer before verifying it, however deep discovery goes.
         rescan();
         return;
       }
